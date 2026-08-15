@@ -4,6 +4,7 @@
   "name": "Todoist",
   "version": "0.1.0",
   "author": "mdetweil",
+  "license": "MIT",
   "description": "Todoist tasks in your bar — add, edit and complete without leaving the desktop",
   "kinds": [
     "bar-widget",

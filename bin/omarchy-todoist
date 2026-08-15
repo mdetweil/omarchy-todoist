@@ -1,0 +1,876 @@
+#!/usr/bin/env python3
+"""Todoist REST API v1 client for the Omarchy shell plugin.
+
+Why a CLI and not XMLHttpRequest inside QML: the API token is a long-lived
+credential that has to live in a 0600 file rather than in the shell's process
+state. The shell only ever runs this and parses JSON.
+
+Authentication uses a personal API token (or OAuth access token) passed as
+a Bearer header — no cookies, no sessions.
+
+Commands:
+  login [--token T]             store the API token
+  logout                        forget the token and cache
+  sync                          refresh the on-disk cache the panel reads
+  complete TASK_ID              mark a task done
+  reopen TASK_ID                mark a done task not-done again
+  add TITLE [--due] [--project] create a task
+  status                        print the cache summary as JSON
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import fcntl
+import getpass
+import json
+import os
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime, timedelta, timezone
+
+API = "https://api.todoist.com/api/v1"
+
+STATE_DIR = os.path.join(
+    os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state")),
+    "omarchy",
+    "todoist",
+)
+TOKEN_PATH = os.path.join(STATE_DIR, "session.json")
+DATA_PATH = os.path.join(STATE_DIR, "data.json")
+OUTBOX_PATH = os.path.join(STATE_DIR, "outbox.json")
+DRAIN_LOCK_PATH = os.path.join(STATE_DIR, "drain.lock")
+
+# Todoist priority scale is inverted relative to TickTick:
+# Todoist 4 = urgent (TickTick 5 = high), 3 = high, 2 = medium, 1 = normal.
+PRIORITY_TODO_TO_DISPLAY = {4: 5, 3: 3, 2: 1, 1: 0}
+PRIORITY_DISPLAY_TO_TODO = {5: 4, 3: 3, 1: 2, 0: 1}
+
+STATUS_TODO = 0
+STATUS_DONE = 2
+
+
+class TodoistError(RuntimeError):
+    def __init__(
+        self,
+        message: str,
+        auth_required: bool = False,
+        status: int | None = None,
+        transient: bool = False,
+    ):
+        super().__init__(message)
+        self.auth_required = auth_required
+        self.status = status
+        self.transient = transient
+
+
+# --------------------------------------------------------------------------
+# state files
+
+
+def _ensure_state_dir() -> None:
+    os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+
+
+def _write_private(path: str, payload: dict) -> None:
+    _ensure_state_dir()
+    tmp = f"{path}.{os.getpid()}.tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, separators=(",", ":"))
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+
+def _read_json(path: str) -> dict:
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return json.load(handle)
+    except (OSError, ValueError):
+        return {}
+
+
+def load_session() -> dict:
+    return _read_json(TOKEN_PATH)
+
+
+# --------------------------------------------------------------------------
+# http
+
+
+def _headers(session: dict) -> dict:
+    token = session.get("token", "")
+    return {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/json",
+    }
+
+
+def request(
+    method: str,
+    path: str,
+    session: dict,
+    payload: dict | None = None,
+    params: dict | None = None,
+    timeout: int = 20,
+) -> dict | list | None:
+    url = f"{API}{path}"
+    if params:
+        url = f"{url}?{urllib.parse.urlencode(params)}"
+
+    body = None if payload is None else json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=body, method=method, headers=_headers(session))
+
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            raw = response.read().decode("utf-8").strip()
+    except urllib.error.HTTPError as error:
+        body_text = ""
+        try:
+            body_text = error.read().decode("utf-8", "replace").strip()
+        except Exception:  # noqa: BLE001
+            pass
+
+        if error.code in (401, 403):
+            raise TodoistError(
+                "Todoist rejected the stored token. Run: omarchy-todoist login",
+                auth_required=True,
+                status=error.code,
+            ) from error
+        if error.code == 429:
+            raise TodoistError(
+                "Todoist is rate limiting this account. Wait a few minutes.",
+                status=429,
+                transient=True,
+            ) from error
+        raise TodoistError(
+            f"HTTP {error.code} from {path}: {body_text[:200]}", status=error.code
+        ) from error
+    except urllib.error.URLError as error:
+        raise TodoistError(
+            f"Network error talking to Todoist: {error.reason}", transient=True
+        ) from error
+    except TimeoutError as error:
+        raise TodoistError("Todoist timed out", transient=True) from error
+
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except ValueError as error:
+        raise TodoistError(f"Malformed JSON from {path}") from error
+
+
+# --------------------------------------------------------------------------
+# auth
+
+
+def authed_session() -> dict:
+    session = load_session()
+    if not session.get("token"):
+        raise TodoistError(
+            "Not signed in to Todoist. Run: omarchy-todoist login",
+            auth_required=True,
+        )
+    return session
+
+
+# --------------------------------------------------------------------------
+# time helpers
+
+
+def to_due_string(value: str) -> str:
+    """Convert our due argument (today/tomorrow/YYYY-MM-DD) to a Todoist due_date."""
+    text = value.strip().lower()
+    today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    if text == "today":
+        target = today
+    elif text == "tomorrow":
+        target = today + timedelta(days=1)
+    elif text == "yesterday":
+        target = today - timedelta(days=1)
+    else:
+        try:
+            target = datetime.strptime(value.strip(), "%Y-%m-%d")
+        except ValueError as error:
+            raise TodoistError("--due wants today, tomorrow, yesterday, or YYYY-MM-DD") from error
+    return target.strftime("%Y-%m-%d")
+
+
+def date_stamp() -> int:
+    return int(datetime.now().strftime("%Y%m%d"))
+
+
+# --------------------------------------------------------------------------
+# task normalization
+#
+# The Todoist REST API returns tasks whose fields differ from TickTick's.
+# We normalize them into the shape Model.js expects so the QML layer
+# does not need to change.
+
+
+def normalize_task(raw: dict) -> dict:
+    """Convert a Todoist task object to the internal shape Model.js uses.
+
+    Field mapping:
+      Todoist content     -> title
+      Todoist labels      -> tags
+      Todoist priority    -> priority (scale inverted: Todoist 4 = our 5)
+      Todoist due.date    -> dueDate / isAllDay
+      Todoist project_id  -> projectId
+      Todoist is_completed-> status (0 = todo, 2 = done)
+    """
+    due_obj = raw.get("due") or {}
+    due_date = due_obj.get("date", "") if isinstance(due_obj, dict) else ""
+    is_all_day = True
+    if due_date and "T" in due_date:
+        is_all_day = False
+
+    # Todoist priority 4 = urgent, 3 = high, 2 = medium, 1 = normal.
+    # Model.js uses TickTick's scale: 5 = high, 3 = medium, 1 = low, 0 = none.
+    todo_priority = int(raw.get("priority") or 1)
+    display_priority = PRIORITY_TODO_TO_DISPLAY.get(todo_priority, 0)
+
+    return {
+        "id": str(raw.get("id") or ""),
+        "title": raw.get("content") or "",
+        "projectId": str(raw.get("project_id") or ""),
+        "status": STATUS_DONE if raw.get("is_completed") else STATUS_TODO,
+        "priority": display_priority,
+        "tags": list(raw.get("labels") or []),
+        "dueDate": due_date,
+        "isAllDay": is_all_day,
+        "sortOrder": 0,
+        "deleted": False,
+    }
+
+
+def denormalize_priority(display_priority: int) -> int:
+    """Convert display priority (0/1/3/5) to Todoist priority (1-4)."""
+    return PRIORITY_DISPLAY_TO_TODO.get(int(display_priority), 1)
+
+
+# --------------------------------------------------------------------------
+# outbox
+
+
+def read_outbox() -> list:
+    data = _read_json(OUTBOX_PATH)
+    entries = data.get("entries") if isinstance(data, dict) else None
+    return entries if isinstance(entries, list) else []
+
+
+def write_outbox(entries: list) -> None:
+    _write_private(OUTBOX_PATH, {"version": 1, "entries": entries})
+
+
+def queue_write(kind: str, payload: dict, reason: str) -> dict:
+    entry = {
+        "id": os.urandom(12).hex(),
+        "kind": kind,
+        "payload": payload,
+        "queuedAt": int(time.time() * 1000),
+        "attempts": 0,
+        "lastError": reason,
+    }
+    write_outbox(read_outbox() + [entry])
+    apply_locally(kind, payload)
+    return entry
+
+
+def apply_locally(kind: str, payload: dict) -> None:
+    cache = _read_json(DATA_PATH)
+    if not cache:
+        return
+
+    if kind == "add":
+        cache.setdefault("tasks", []).append(payload["task"])
+
+    elif kind in ("complete", "reopen"):
+        target = STATUS_DONE if kind == "complete" else STATUS_TODO
+        for task in cache.get("tasks", []):
+            if task.get("id") == payload["taskId"]:
+                task["status"] = target
+                break
+
+    elif kind == "update":
+        for i, task in enumerate(cache.get("tasks", [])):
+            if task.get("id") == payload["taskId"]:
+                cache["tasks"][i] = apply_edit(task, payload["fields"])
+                break
+
+    cache["queued"] = len(read_outbox())
+    _write_private(DATA_PATH, cache)
+
+
+def replay(entry: dict, session: dict) -> None:
+    kind = entry.get("kind")
+    payload = entry.get("payload") or {}
+
+    if kind == "add":
+        task = payload["task"]
+        body: dict = {"content": task["title"]}
+        if task.get("dueDate"):
+            body["due_date"] = task["dueDate"]
+        if task.get("projectId"):
+            body["project_id"] = task["projectId"]
+        if task.get("priority"):
+            body["priority"] = denormalize_priority(task["priority"])
+        if task.get("tags"):
+            body["labels"] = task["tags"]
+        request("POST", "/tasks", session, payload=body)
+
+    elif kind == "complete":
+        request("POST", f"/tasks/{payload['taskId']}/close", session)
+
+    elif kind == "reopen":
+        request("POST", f"/tasks/{payload['taskId']}/reopen", session)
+
+    elif kind == "update":
+        task_id = payload["taskId"]
+        fields = payload["fields"]
+        body = {}
+        if "title" in fields:
+            body["content"] = fields["title"]
+        if "priority" in fields:
+            body["priority"] = denormalize_priority(fields["priority"])
+        if "tags" in fields:
+            body["labels"] = fields["tags"]
+        if "due" in fields:
+            body["due_date"] = to_due_string(fields["due"])
+        if body:
+            request("POST", f"/tasks/{task_id}", session, payload=body)
+
+    else:
+        raise TodoistError(f"Unknown queued action {kind!r}")
+
+
+@contextlib.contextmanager
+def drain_lock():
+    _ensure_state_dir()
+    handle = open(DRAIN_LOCK_PATH, "w")
+    try:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+    finally:
+        handle.close()
+
+
+def drain_outbox(session: dict) -> dict:
+    entries = read_outbox()
+    if not entries:
+        return {"sent": 0, "queued": 0, "dropped": 0}
+
+    remaining, sent, dropped = [], 0, 0
+    stalled = False
+
+    for entry in entries:
+        if stalled:
+            remaining.append(entry)
+            continue
+        try:
+            replay(entry, session)
+            sent += 1
+        except TodoistError as error:
+            entry["attempts"] = int(entry.get("attempts", 0)) + 1
+            entry["lastError"] = str(error)
+            if error.transient:
+                remaining.append(entry)
+                stalled = True
+            else:
+                dropped += 1
+
+    write_outbox(remaining)
+    return {"sent": sent, "queued": len(remaining), "dropped": dropped}
+
+
+# --------------------------------------------------------------------------
+# reads
+
+
+def fetch_state(session: dict, scope: str = "full") -> dict:
+    """One sync round: tasks and projects.
+
+    Scope limits what gets re-fetched. A task write does not need projects
+    re-fetched; passing scope='tasks' skips that round trip.
+    """
+    previous = _read_json(DATA_PATH)
+    want_tasks = scope in ("full", "tasks")
+
+    if not want_tasks:
+        tasks = previous.get("tasks", [])
+        projects = previous.get("projects", [])
+        inbox_id = previous.get("inboxId", "")
+    else:
+        # Todoist returns active (non-completed) tasks by default.
+        raw_tasks = request("GET", "/tasks", session) or []
+        tasks = [normalize_task(t) for t in raw_tasks if isinstance(t, dict)]
+
+        raw_projects = request("GET", "/projects", session) or []
+        projects = []
+        inbox_id = ""
+        for p in raw_projects:
+            if not isinstance(p, dict):
+                continue
+            projects.append({
+                "id": str(p.get("id") or ""),
+                "name": p.get("name") or "",
+                "color": p.get("color") or "",
+                "closed": False,
+            })
+            if p.get("is_inbox_project"):
+                inbox_id = str(p.get("id") or "")
+
+    # Labels (Todoist's equivalent of tags) carry a color.
+    # Only fetch on full sync — they change rarely.
+    if scope == "full":
+        raw_labels = request("GET", "/labels", session) or []
+        tags = [
+            {
+                "name": str(l.get("name") or "").lower(),
+                "label": str(l.get("name") or ""),
+                "color": str(l.get("color") or ""),
+            }
+            for l in raw_labels
+            if isinstance(l, dict) and l.get("name")
+        ]
+    else:
+        tags = previous.get("tags", [])
+
+    return {
+        "syncedAt": int(time.time() * 1000),
+        "scope": scope,
+        "inboxId": inbox_id,
+        "tags": tags,
+        "projects": projects,
+        "tasks": tasks,
+        # No habits or pomodoro in Todoist's public API.
+        "habits": [],
+        "checkins": {},
+        "todayStamp": date_stamp(),
+        "authRequired": False,
+        "error": None,
+        # Stubs so Model.js parseCache does not see undefined.
+        "pomoStats": {},
+        "pomoPrefs": {},
+    }
+
+
+def write_cache(state: dict) -> None:
+    _write_private(DATA_PATH, state)
+
+
+def write_error_cache(message: str, auth_required: bool) -> None:
+    cache = _read_json(DATA_PATH)
+    cache["error"] = message
+    cache["authRequired"] = auth_required
+    cache["queued"] = len(read_outbox())
+    cache["erroredAt"] = int(time.time() * 1000)
+    cache.setdefault("tasks", [])
+    cache.setdefault("habits", [])
+    cache.setdefault("projects", [])
+    cache.setdefault("checkins", {})
+    _write_private(DATA_PATH, cache)
+
+
+def cached_task(task_id: str) -> dict:
+    for task in _read_json(DATA_PATH).get("tasks", []):
+        if task.get("id") == task_id:
+            return task
+    raise TodoistError(f"Task {task_id} is not in the local cache; sync first")
+
+
+def find_task(task_id: str, session: dict) -> dict:
+    """Locate a task whether open or recently completed."""
+    try:
+        return cached_task(task_id)
+    except TodoistError:
+        pass
+    # Try fetching directly by id from the API (works for completed tasks too
+    # within the REST API's 30-day window).
+    raw = request("GET", f"/tasks/{task_id}", session)
+    if isinstance(raw, dict) and raw.get("id"):
+        return normalize_task(raw)
+    raise TodoistError(f"Task {task_id} not found in cache or Todoist")
+
+
+# --------------------------------------------------------------------------
+# writes
+
+
+def create_task(
+    title: str,
+    project_id: str | None,
+    due: str | None,
+    priority: int = 0,
+    tags: list | None = None,
+) -> dict:
+    cache = _read_json(DATA_PATH)
+    body: dict = {"content": title}
+    if project_id:
+        body["project_id"] = project_id
+    if due:
+        body["due_date"] = to_due_string(due)
+    if priority:
+        body["priority"] = denormalize_priority(priority)
+    if tags:
+        body["labels"] = [str(t).strip().lower() for t in tags if str(t).strip()]
+
+    def call(session):
+        raw = request("POST", "/tasks", session, payload=body)
+        return normalize_task(raw) if isinstance(raw, dict) else {}
+
+    try:
+        session = authed_session()
+        task = call(session)
+    except TodoistError as error:
+        if not error.transient:
+            raise
+        # Build a local placeholder so the panel shows it immediately.
+        task = {
+            "id": os.urandom(12).hex(),
+            "title": title,
+            "projectId": project_id or cache.get("inboxId") or "",
+            "status": STATUS_TODO,
+            "priority": int(priority or 0),
+            "tags": [str(t).strip().lower() for t in (tags or []) if str(t).strip()],
+            "dueDate": to_due_string(due) if due else "",
+            "isAllDay": True,
+            "sortOrder": 0,
+            "deleted": False,
+        }
+        queue_write("add", {"task": task}, str(error))
+        task["queued"] = True
+    return task
+
+
+def set_task_status(task_id: str, done: bool) -> dict:
+    endpoint = f"/tasks/{task_id}/close" if done else f"/tasks/{task_id}/reopen"
+
+    try:
+        session = authed_session()
+        request("POST", endpoint, session)
+    except TodoistError as error:
+        if not error.transient:
+            raise
+        queue_write(
+            "complete" if done else "reopen",
+            {"taskId": task_id},
+            str(error),
+        )
+        return {"id": task_id, "queued": True}
+    return {"id": task_id}
+
+
+def apply_edit(task: dict, fields: dict) -> dict:
+    edited = dict(task)
+    if "title" in fields:
+        edited["title"] = fields["title"]
+    if "priority" in fields:
+        edited["priority"] = int(fields["priority"] or 0)
+    if "tags" in fields:
+        edited["tags"] = [str(t).strip().lower() for t in (fields["tags"] or []) if str(t).strip()]
+    if "due" in fields:
+        edited["dueDate"] = to_due_string(fields["due"])
+        edited["isAllDay"] = True
+    return edited
+
+
+def update_task(task_id: str, fields: dict) -> dict:
+    body: dict = {}
+    if "title" in fields:
+        body["content"] = fields["title"]
+    if "priority" in fields:
+        body["priority"] = denormalize_priority(int(fields["priority"] or 0))
+    if "tags" in fields:
+        body["labels"] = [str(t).strip().lower() for t in (fields["tags"] or []) if str(t).strip()]
+    if "due" in fields:
+        body["due_date"] = to_due_string(fields["due"])
+
+    if not body:
+        raise TodoistError("Nothing to update")
+
+    try:
+        session = authed_session()
+        raw = request("POST", f"/tasks/{task_id}", session, payload=body)
+        return normalize_task(raw) if isinstance(raw, dict) else {"id": task_id}
+    except TodoistError as error:
+        if not error.transient:
+            raise
+        queue_write("update", {"taskId": task_id, "fields": fields}, str(error))
+        return {"id": task_id, "queued": True}
+
+
+def delete_task(task_id: str) -> dict:
+    session = authed_session()
+    request("DELETE", f"/tasks/{task_id}", session)
+    return {"id": task_id}
+
+
+# --------------------------------------------------------------------------
+# commands
+
+
+def cmd_login(args) -> int:
+    if args.token:
+        raw = getpass.getpass("Todoist API token: ") if args.token == "-" else args.token
+    else:
+        raw = getpass.getpass("Todoist API token: ")
+
+    token = raw.strip()
+    if not token:
+        raise TodoistError("That token was empty")
+
+    candidate = {
+        "token": token,
+        "savedAt": int(time.time() * 1000),
+    }
+    # Verify the token works before storing it.
+    state = fetch_state(candidate)
+    _write_private(TOKEN_PATH, candidate)
+    write_cache(state)
+    print(
+        f"Connected: {len(state['tasks'])} open tasks, "
+        f"{len(state['projects'])} projects."
+    )
+    return 0
+
+
+def cmd_logout(_args) -> int:
+    for path in (TOKEN_PATH, DATA_PATH, OUTBOX_PATH):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+    print("Signed out of Todoist.")
+    return 0
+
+
+def cmd_sync(args) -> int:
+    scope = getattr(args, "scope", None) or "full"
+
+    max_age = getattr(args, "max_age", None)
+    if max_age:
+        cache = _read_json(DATA_PATH)
+        synced_at = int(cache.get("syncedAt") or 0)
+        age = (time.time() * 1000 - synced_at) / 1000
+        if synced_at and age < float(max_age) and not read_outbox():
+            print(json.dumps({"ok": True, "skipped": True, "ageSeconds": round(age)}))
+            return 0
+
+    outbox = {"sent": 0, "queued": len(read_outbox()), "dropped": 0}
+    try:
+        if outbox["queued"]:
+            with drain_lock() as held:
+                if held:
+                    session = authed_session()
+                    outbox = drain_outbox(session)
+                else:
+                    outbox = dict(outbox, skippedDrain=True)
+        session = authed_session()
+        state = fetch_state(session, scope)
+    except TodoistError as error:
+        write_error_cache(str(error), error.auth_required)
+        raise
+
+    state["queued"] = len(read_outbox())
+    write_cache(state)
+    print(json.dumps({
+        "ok": True,
+        "scope": scope,
+        "tasks": len(state["tasks"]),
+        "queued": state["queued"],
+        "sent": outbox.get("sent", 0),
+        "dropped": outbox.get("dropped", 0),
+    }))
+    return 0
+
+
+def sync_after_write(args, scope: str) -> None:
+    previous = getattr(args, "scope", None)
+    args.scope = scope
+    try:
+        cmd_sync(args)
+    finally:
+        args.scope = previous
+
+
+def queued_result(payload: dict) -> int:
+    print(json.dumps(dict(payload, ok=True, queued=True)))
+    return 0
+
+
+def cmd_complete(args) -> int:
+    result = set_task_status(args.task_id, done=True)
+    if result.get("queued"):
+        return queued_result({"completed": args.task_id})
+    sync_after_write(args, "tasks")
+    print(json.dumps({"ok": True, "completed": args.task_id}))
+    return 0
+
+
+def cmd_reopen(args) -> int:
+    result = set_task_status(args.task_id, done=False)
+    if result.get("queued"):
+        return queued_result({"reopened": args.task_id})
+    sync_after_write(args, "tasks")
+    print(json.dumps({"ok": True, "reopened": args.task_id}))
+    return 0
+
+
+def cmd_add(args) -> int:
+    task = create_task(
+        args.title,
+        args.project,
+        args.due,
+        priority=args.priority,
+        tags=(args.tags or "").split(",") if args.tags else None,
+    )
+    if task.get("queued"):
+        return queued_result({"id": task["id"], "title": task["title"]})
+    sync_after_write(args, "tasks")
+    print(json.dumps({"ok": True, "id": task["id"], "title": task["title"]}))
+    return 0
+
+
+def cmd_update(args) -> int:
+    fields = {}
+    if args.title is not None:
+        fields["title"] = args.title
+    if args.priority is not None:
+        fields["priority"] = args.priority
+    if args.tags is not None:
+        fields["tags"] = [t for t in args.tags.split(",") if t.strip()]
+    if args.due is not None:
+        fields["due"] = args.due
+    if not fields:
+        raise TodoistError("Nothing to update; pass --title, --due, --priority or --tags")
+
+    task = update_task(args.task_id, fields)
+    if task.get("queued"):
+        return queued_result({"updated": args.task_id})
+    sync_after_write(args, "tasks")
+    print(json.dumps({"ok": True, "updated": task.get("id"), "title": task.get("title")}))
+    return 0
+
+
+def cmd_delete(args) -> int:
+    delete_task(args.task_id)
+    sync_after_write(args, "tasks")
+    print(json.dumps({"ok": True, "deleted": args.task_id}))
+    return 0
+
+
+def cmd_status(_args) -> int:
+    cache = _read_json(DATA_PATH)
+    print(
+        json.dumps({
+            "signedIn": bool(load_session().get("token")),
+            "syncedAt": cache.get("syncedAt"),
+            "tasks": len(cache.get("tasks", [])),
+            "error": cache.get("error"),
+            "authRequired": bool(cache.get("authRequired")),
+            "queued": len(read_outbox()),
+            "dataPath": DATA_PATH,
+        })
+    )
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="omarchy-todoist", description=__doc__.split("\n")[0])
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    login = sub.add_parser("login", help="store a Todoist API token")
+    login.add_argument(
+        "--token",
+        help="API token; pass '-' to be prompted (keeps the value out of shell history)",
+    )
+    login.set_defaults(func=cmd_login)
+
+    sub.add_parser("logout", help="forget the token and cache").set_defaults(func=cmd_logout)
+
+    sync = sub.add_parser("sync", help="refresh the cache the panel reads")
+    sync.add_argument(
+        "--max-age",
+        type=float,
+        help="skip if the cache is younger than this many seconds and nothing is queued",
+    )
+    sync.add_argument(
+        "--scope",
+        choices=("full", "tasks"),
+        default="full",
+        help="limit the refresh to tasks only",
+    )
+    sync.set_defaults(func=cmd_sync)
+
+    sub.add_parser("status", help="print cache state as JSON").set_defaults(func=cmd_status)
+
+    complete = sub.add_parser("complete", help="mark a task done")
+    complete.add_argument("task_id")
+    complete.set_defaults(func=cmd_complete)
+
+    reopen = sub.add_parser("reopen", help="mark a done task not-done")
+    reopen.add_argument("task_id")
+    reopen.set_defaults(func=cmd_reopen)
+
+    add = sub.add_parser("add", help="create a task")
+    add.add_argument("title")
+    add.add_argument("--project", help="project id; defaults to the inbox")
+    add.add_argument("--due", help="today, tomorrow, yesterday, or YYYY-MM-DD")
+    add.add_argument(
+        "--priority", type=int, default=0, choices=(0, 1, 3, 5),
+        help="display priority: 0 none, 1 low, 3 medium, 5 high (maps to Todoist 1-4)",
+    )
+    add.add_argument("--tags", help="comma-separated label names")
+    add.set_defaults(func=cmd_add)
+
+    edit = sub.add_parser("update", help="edit a task in place")
+    edit.add_argument("task_id")
+    edit.add_argument("--title")
+    edit.add_argument("--due", help="today, tomorrow, yesterday, or YYYY-MM-DD")
+    edit.add_argument("--priority", type=int, choices=(0, 1, 3, 5))
+    edit.add_argument("--tags", help="comma-separated; an empty value clears them")
+    edit.set_defaults(func=cmd_update)
+
+    remove = sub.add_parser("delete", help="delete a task outright")
+    remove.add_argument("task_id")
+    remove.set_defaults(func=cmd_delete)
+
+    return parser
+
+
+def main(argv: list[str]) -> int:
+    args = build_parser().parse_args(argv)
+    try:
+        return args.func(args)
+    except TodoistError as error:
+        print(
+            json.dumps({"ok": False, "error": str(error), "authRequired": error.auth_required}),
+            file=sys.stderr,
+        )
+        return 3 if error.auth_required else 1
+    except KeyboardInterrupt:
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

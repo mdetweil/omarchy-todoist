@@ -1,0 +1,105 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.mdetweil.todoist",
+  "name": "Todoist",
+  "version": "0.1.0",
+  "author": "mdetweil",
+  "description": "Todoist tasks in your bar — add, edit and complete without leaving the desktop",
+  "kinds": [
+    "bar-widget",
+    "service"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml",
+    "service": "Service.qml"
+  },
+  "barWidget": {
+    "displayName": "Todoist",
+    "description": "Tasks due today, quick-add, and inline editing",
+    "category": "Info",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "showTasks": true,
+      "includeOverdue": true,
+      "horizon": "Today",
+      "maxTasks": 12,
+      "barLabel": "Count",
+      "undoSeconds": 6,
+      "syncInterval": "5 minutes"
+    },
+    "schema": [
+      {
+        "key": "syncInterval",
+        "type": "enum",
+        "label": "Background sync",
+        "description": "How often the bar count refreshes on its own. Opening the panel always syncs.",
+        "options": [
+          "2 minutes",
+          "5 minutes",
+          "15 minutes",
+          "1 hour",
+          "Only when opened"
+        ],
+        "defaultValue": "5 minutes"
+      },
+      {
+        "key": "horizon",
+        "type": "enum",
+        "label": "Task horizon",
+        "description": "Which due dates count as \"up next\" in the panel and the bar count.",
+        "options": [
+          "Today",
+          "Tomorrow",
+          "Next 7 days"
+        ],
+        "defaultValue": "Today"
+      },
+      {
+        "key": "includeOverdue",
+        "type": "boolean",
+        "label": "Include overdue",
+        "description": "Count and list tasks whose due date has already passed.",
+        "defaultValue": true
+      },
+      {
+        "key": "showTasks",
+        "type": "boolean",
+        "label": "Show tasks",
+        "defaultValue": true
+      },
+      {
+        "key": "maxTasks",
+        "type": "integer",
+        "label": "Max tasks listed",
+        "description": "The panel scrolls past this; the cap keeps a 200-task day from becoming a 200-row popup.",
+        "min": 3,
+        "max": 50,
+        "step": 1,
+        "defaultValue": 12
+      },
+      {
+        "key": "barLabel",
+        "type": "enum",
+        "label": "Bar label",
+        "description": "Count shows the number due, Next shows the next task's title, Icon shows nothing but the glyph.",
+        "options": [
+          "Count",
+          "Next",
+          "Icon"
+        ],
+        "defaultValue": "Count"
+      },
+      {
+        "key": "undoSeconds",
+        "type": "integer",
+        "label": "Undo window (seconds)",
+        "description": "How long a completion is held before it is sent. 0 sends immediately with no undo.",
+        "min": 0,
+        "max": 30,
+        "step": 1,
+        "defaultValue": 6
+      }
+    ]
+  }
+}

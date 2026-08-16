@@ -22,7 +22,7 @@ BarWidget {
   readonly property bool hasWork: panelLoader.item ? panelLoader.item.hasWork : false
   readonly property bool signedIn: panelLoader.item ? panelLoader.item.signedIn : false
 
-  readonly property string setupIcon: ""
+  readonly property string setupIcon: "󰄴"
 
   readonly property string activeIcon: !signedIn ? setupIcon : icon
   readonly property string activeLabel: !signedIn ? "setup" : panelLabel

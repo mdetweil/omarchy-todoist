@@ -28,6 +28,7 @@ BarWidget {
   readonly property string activeLabel: !signedIn ? "setup" : panelLabel
 
   readonly property string barLabelMode: setting("barLabel", "Count")
+  readonly property bool iconOnly: barLabelMode === "Icon"
   readonly property string nextTitle: panelLoader.item ? panelLoader.item.nextTitle : ""
   readonly property bool marquee: !vertical && signedIn
     && barLabelMode === "Next" && nextTitle !== ""
@@ -121,12 +122,13 @@ BarWidget {
     id: button
     anchors.fill: parent
     bar: root.bar
-    text: (root.vertical || root.marquee) ? "" : root.displayText
-    fixedWidth: root.marquee ? root.marqueeWidth + Style.space(30) : -1
-    labelVisible: !root.vertical
+    text: (root.vertical || root.marquee || root.iconOnly) ? "" : root.displayText
+    fontSize: root.iconOnly ? Style.bar.iconFont : Style.font.body
+    fixedWidth: root.iconOnly ? Style.bar.iconSlot : (root.marquee ? root.marqueeWidth + Style.space(30) : -1)
+    labelVisible: !root.vertical && !root.iconOnly
     hasVisualContent: root.marquee
       ? true
-      : (root.vertical ? root.verticalLines.length > 0 : text !== "")
+      : (root.vertical ? root.verticalLines.length > 0 : (root.iconOnly ? root.activeIcon !== "" : text !== ""))
     fixedHeight: root.vertical ? root.verticalLines.length * Style.bar.iconSlot : -1
 
     active: root.overdueCount > 0
@@ -141,6 +143,17 @@ BarWidget {
       if (b === Qt.MiddleButton) root.refresh()
       else if (b === Qt.RightButton) root.cycleBarLabel()
       else root.togglePanel()
+    }
+
+    OpticalGlyph {
+      visible: root.iconOnly && !root.vertical
+      anchors.centerIn: parent
+      width: Style.bar.iconCanvas
+      height: Style.bar.iconCanvas
+      text: root.activeIcon
+      fontFamily: button.fontFamily
+      fontSize: Style.bar.iconFont
+      color: button.foreground
     }
 
     Row {

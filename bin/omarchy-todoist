@@ -172,6 +172,35 @@ def request(
         raise TodoistError(f"Malformed JSON from {path}") from error
 
 
+def request_paginated(
+    path: str,
+    session: dict,
+    params: dict | None = None,
+    timeout: int = 20,
+) -> list:
+    results: list = []
+    current_params = dict(params or {})
+    while True:
+        resp = request("GET", path, session, params=current_params, timeout=timeout)
+        if resp is None:
+            break
+        if isinstance(resp, list):
+            results.extend(resp)
+            break
+        if isinstance(resp, dict):
+            items = resp.get("results")
+            if isinstance(items, list):
+                results.extend(items)
+            next_cursor = resp.get("next_cursor")
+            if next_cursor:
+                current_params["cursor"] = next_cursor
+            else:
+                break
+        else:
+            break
+    return results
+
+
 # --------------------------------------------------------------------------
 # auth
 
@@ -242,17 +271,19 @@ def normalize_task(raw: dict) -> dict:
     todo_priority = int(raw.get("priority") or 1)
     display_priority = PRIORITY_TODO_TO_DISPLAY.get(todo_priority, 0)
 
+    is_done = bool(raw.get("checked") or raw.get("is_completed") or raw.get("completed_at"))
+
     return {
         "id": str(raw.get("id") or ""),
         "title": raw.get("content") or "",
         "projectId": str(raw.get("project_id") or ""),
-        "status": STATUS_DONE if raw.get("is_completed") else STATUS_TODO,
+        "status": STATUS_DONE if is_done else STATUS_TODO,
         "priority": display_priority,
         "tags": list(raw.get("labels") or []),
         "dueDate": due_date,
         "isAllDay": is_all_day,
-        "sortOrder": 0,
-        "deleted": False,
+        "sortOrder": int(raw.get("child_order") or 0),
+        "deleted": bool(raw.get("is_deleted", False)),
     }
 
 
@@ -421,10 +452,10 @@ def fetch_state(session: dict, scope: str = "full") -> dict:
         inbox_id = previous.get("inboxId", "")
     else:
         # Todoist returns active (non-completed) tasks by default.
-        raw_tasks = request("GET", "/tasks", session) or []
+        raw_tasks = request_paginated("/tasks", session)
         tasks = [normalize_task(t) for t in raw_tasks if isinstance(t, dict)]
 
-        raw_projects = request("GET", "/projects", session) or []
+        raw_projects = request_paginated("/projects", session)
         projects = []
         inbox_id = ""
         for p in raw_projects:
@@ -436,13 +467,13 @@ def fetch_state(session: dict, scope: str = "full") -> dict:
                 "color": p.get("color") or "",
                 "closed": False,
             })
-            if p.get("is_inbox_project"):
+            if p.get("inbox_project") or p.get("is_inbox_project"):
                 inbox_id = str(p.get("id") or "")
 
     # Labels (Todoist's equivalent of tags) carry a color.
     # Only fetch on full sync — they change rarely.
     if scope == "full":
-        raw_labels = request("GET", "/labels", session) or []
+        raw_labels = request_paginated("/labels", session)
         tags = [
             {
                 "name": str(l.get("name") or "").lower(),
